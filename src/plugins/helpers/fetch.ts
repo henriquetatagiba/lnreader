@@ -1,7 +1,12 @@
 import { getUserAgent } from '@hooks/persisted/useUserAgent';
 import NativeFile from '@modules/native-file';
 import { parse as parseProto } from 'protobufjs';
-import { isCloudflareChallenge, solveCloudflareChallenge } from './cloudflare';
+import {
+  isCloudflareChallenge,
+  isWebViewResponse,
+  solveCloudflareChallenge,
+  toWebViewResponse,
+} from './cloudflare';
 
 type FetchInit = {
   headers?: Record<string, string> | Headers;
@@ -51,19 +56,43 @@ const getUserAgentHeader = (headers: FetchInit['headers']) => {
     .pop()?.[1];
 };
 
+const headersToRecord = (headers: FetchInit['headers']) => {
+  const record: Record<string, string> = {};
+  new Headers(headers).forEach((value, name) => {
+    record[name] = value;
+  });
+  return record;
+};
+
 /**
  * On a Cloudflare challenge, clears it in a hidden WebView and retries once.
- * If it cannot be cleared the challenge response is returned unchanged, so
- * plugins keep reporting it and the user can still solve it in the WebView.
+ * Sites that let the WebView through without issuing a clearance answer the
+ * request inside the WebView instead. If neither works the challenge response
+ * is returned unchanged, so plugins keep reporting it and the user can still
+ * solve it in the WebView.
  */
 const fetchWithCloudflareBypass = async (url: string, init: FetchInit) => {
+  const sentAt = Date.now();
   const response = await fetch(url, init);
   if (!isCloudflareChallenge(response)) {
     return response;
   }
-  const userAgent = getUserAgentHeader(init.headers) || getUserAgent();
-  if (await solveCloudflareChallenge(url, userAgent)) {
+  // The page can only replay text bodies; FormData uploads are not sent.
+  const body = typeof init.body === 'string' ? init.body : undefined;
+  const result = await solveCloudflareChallenge({
+    url,
+    method: (init.method || 'GET').toUpperCase(),
+    headers: headersToRecord(init.headers),
+    body,
+    captureResponse: init.body === undefined || body !== undefined,
+    userAgent: getUserAgentHeader(init.headers) || getUserAgent(),
+    sentAt,
+  });
+  if (result.type === 'clearance') {
     return fetch(url, init);
+  }
+  if (result.type === 'response') {
+    return toWebViewResponse(result);
   }
   return response;
 };
@@ -111,6 +140,9 @@ export const fetchText = async (
     const res = await fetchWithCloudflareBypass(url, init);
     if (!res.ok) {
       throw new Error();
+    }
+    if (isWebViewResponse(res)) {
+      return await res.text();
     }
     const blob = await res.blob();
     return await new Promise((resolve, reject) => {
